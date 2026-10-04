@@ -3,7 +3,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { EXAM_SUBJECTS } = require('./subjects');
+const { EXAM_SUBJECTS, OL_NAMES, AL_NAMES, OL_SUBJECTS, AL_SUBJECTS, SCHOLARSHIP_NAMES, SCHOLARSHIP_SUBJECTS } = require('./subjects');
 const persistence = require('./firebase-store');
 
 function loadDotEnv() {
@@ -19,6 +19,7 @@ function loadDotEnv() {
 loadDotEnv();
 
 const ROOT = __dirname;
+const PUBLIC_DIR = path.join(ROOT, 'public');
 const DATA_DIR = path.join(ROOT, 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const DB_FILE = path.join(DATA_DIR, 'nervaedu.json');
@@ -62,6 +63,19 @@ function phoneKey(value) {
 }
 function validSubject(value) {
   return typeof value === 'string' && (EXAM_SUBJECTS.includes(value) || /^(?:O\/L|A\/L|Other) — [^\r\n,]{2,80}$/.test(value));
+}
+const HIDDEN_HTTP_NAMES = new Set(['data', 'private', 'config', 'node_modules', '.git', '.npm-cache', '.test-run', 'logs', 'log', 'backups', 'backup', 'server.js', 'firebase-store.js', 'subjects.js', 'package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock']);
+function isPrivateHttpPath(rawUrl) {
+  const rawPath = String(rawUrl || '/').split(/[?#]/, 1)[0];
+  let pathname;
+  try { pathname = decodeURIComponent(rawPath); } catch { return true; }
+  if (pathname.includes('\\') || /%(?:2f|5c)/i.test(rawPath)) return true;
+  const parts = pathname.split('/').filter(Boolean);
+  if (parts.some(part => part === '.' || part === '..')) return true;
+  return parts.some(part => {
+    const name = part.toLowerCase();
+    return name.startsWith('.env') || HIDDEN_HTTP_NAMES.has(name) || /\.(?:log|bak|backup|old|sqlite|db)$/i.test(name);
+  });
 }
 const isVerifiedTeacher = user => user?.role === 'teacher' && user.verificationStatus !== 'pending' && user.verificationStatus !== 'rejected';
 const publicUser = (u) => ({ id: u.id, role: u.role, name: u.name, age: u.age, phone: u.phone, address: u.address, school: u.school, subjects: u.subjects, whatsapp: u.whatsapp, qualification: u.qualification, otherQualification: u.otherQualification, thumbnail: u.thumbnail, isVerified: u.role === 'teacher' ? isVerifiedTeacher(u) : undefined, verificationStatus: u.role === 'teacher' ? (u.verificationStatus || 'verified') : undefined });
@@ -164,6 +178,23 @@ function signedImageKitUrl(filePath) {
   const pathForSignature = filePath.slice(1) + expire;
   const signature = crypto.createHmac('sha1', process.env.IMAGEKIT_PRIVATE_KEY).update(pathForSignature).digest('hex');
   return `${imageKitEndpoint}${filePath}?ik-t=${expire}&ik-s=${signature}`;
+}
+async function imageKitRequest(fileId, method = 'GET') {
+  if (!/^[A-Za-z0-9_-]{8,160}$/.test(fileId)) throw fail(400, 'ImageKit returned invalid file details.');
+  const credentials = Buffer.from(process.env.IMAGEKIT_PRIVATE_KEY + ':').toString('base64');
+  let response;
+  try {
+    response = await fetch(`https://api.imagekit.io/v1/files/${encodeURIComponent(fileId)}${method === 'GET' ? '/details' : ''}`, {
+      method, headers: { authorization: `Basic ${credentials}` }, signal: AbortSignal.timeout(10000),
+    });
+  } catch { throw fail(503, 'NervaEdu could not verify the upload with ImageKit. Please try again.'); }
+  if (method === 'DELETE') return response.ok;
+  if (response.status === 404) throw fail(400, 'ImageKit could not find the uploaded file.');
+  if (!response.ok) throw fail(503, 'NervaEdu could not verify the upload with ImageKit. Please try again.');
+  try { return await response.json(); } catch { throw fail(503, 'ImageKit returned unreadable file details.'); }
+}
+async function discardImageKitFile(fileId) {
+  try { await imageKitRequest(fileId, 'DELETE'); } catch { /* Never register an upload that failed its privacy check. */ }
 }
 function whatsappNumber(value) {
   let digits = String(value || '').replace(/\D/g, '');
@@ -421,6 +452,16 @@ async function api(req, res, url) {
       if (type === 'video' && !validPrice(priceLkr)) throw fail(400, 'Set a whole-number video price in LKR.');
       const videos = db.resources.filter(r => r.teacherId === me.id && r.subject === subject && r.type === 'video');
       if (type === 'video' && videos.length >= 5) throw fail(400, `You can upload up to 5 videos for ${subject}.`);
+      const details = await imageKitRequest(fileId);
+      let detailPath = '', detailUrl;
+      try { detailPath = decodeURIComponent(details.filePath || ''); detailUrl = new URL(details.url); } catch { throw fail(400, 'ImageKit returned invalid file details.'); }
+      if (details.fileId !== fileId || detailPath !== decodedFilePath || Number(details.size) !== size || detailUrl.origin !== imageKitEndpoint || decodeURIComponent(detailUrl.pathname) !== decodedFilePath) throw fail(400, 'The uploaded file details do not match the registered resource.');
+      const allowedMime = type === 'video' ? ['video/mp4', 'video/webm', 'video/quicktime'] : ['application/pdf'];
+      if (!allowedMime.includes(details.mime)) throw fail(400, 'The uploaded file is not a supported video or PDF.');
+      if ((type === 'video' && details.isPrivateFile !== true) || (type === 'pdf' && details.isPrivateFile === true)) {
+        if (detailPath.startsWith(`/nervaedu/${me.id}/`)) await discardImageKitFile(fileId);
+        throw fail(400, type === 'video' ? 'ImageKit did not mark this video private, so NervaEdu rejected the upload.' : 'This PDF is private in ImageKit and cannot be shared with students.');
+      }
       const row = { id: crypto.randomUUID(), teacherId: me.id, teacherName: me.name, subject, title, name, type, ...(type === 'video' ? { priceLkr, imageKitPrivate: true } : {}), imageKitFileId: fileId, imageKitFilePath: filePath, url: type === 'video' ? '' : clean(data.url, 1200), createdAt: new Date().toISOString() };
       if (type === 'video') row.url = `/media/${row.id}`;
       db.resources.unshift(row); await save(); return json(res, 201, { resources: [row] });
@@ -505,8 +546,8 @@ function staticFile(req, res, pathname) {
     catch (error) { return json(res, error.status || 503, { error: error.message }); }
   }
   if (decoded.startsWith('/uploads/')) {
-    const name = path.basename(decoded.slice('/uploads/'.length));
-    if (name !== decoded.slice('/uploads/'.length)) return json(res, 404, { error: 'File not found.' });
+    const name = decoded.slice('/uploads/'.length);
+    if (!/^[0-9a-f-]{36}\.(?:jpg|png|webp|mp4|webm|mov|pdf)$/i.test(name)) return json(res, 404, { error: 'File not found.' });
     const viewer = sessionUser(req);
     if (!viewer) return json(res, 401, { error: 'Please sign in to view this file.' });
     const assetURL = '/uploads/' + name;
@@ -515,7 +556,8 @@ function staticFile(req, res, pathname) {
     if (!resource && !isTeacherPhoto) return json(res, 404, { error: 'File not found.' });
     if (viewer.role === 'student' && resource?.type === 'video' && !videoIsUnlocked(viewer.id, resource)) return json(res, 403, { error: 'This video is locked. Ask the teacher to unlock it after checking your payment receipt.' });
     if (viewer.role === 'teacher' && resource && resource.teacherId !== viewer.id) return json(res, 403, { error: 'You cannot view another teacher’s resource.' });
-    const file = path.join(UPLOAD_DIR, name);
+    const file = path.resolve(UPLOAD_DIR, name);
+    if (!file.startsWith(UPLOAD_DIR + path.sep)) return json(res, 404, { error: 'File not found.' });
     if (!fs.existsSync(file)) return json(res, 404, { error: 'File not found.' });
     const ext = path.extname(name); const type = Object.entries(mimeExt).find(([, e]) => e === ext)?.[0] || 'application/octet-stream';
     const size = fs.statSync(file).size;
@@ -532,14 +574,31 @@ function staticFile(req, res, pathname) {
     }
     headers['content-length'] = size; res.writeHead(200, headers); return fs.createReadStream(file).pipe(res);
   }
-  const relative = decoded === '/' ? 'index.html' : decoded.replace(/^\/+/, '');
-  const target = path.resolve(ROOT, relative);
-  if (!target.startsWith(ROOT + path.sep) || !fs.existsSync(target) || !fs.statSync(target).isFile()) return json(res, 404, { error: 'File not found.' });
-  const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8' };
-  res.writeHead(200, { 'content-type': types[path.extname(target)] || 'application/octet-stream', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' }); fs.createReadStream(target).pipe(res);
+  if (decoded === '/assets/catalog.js') {
+    const catalog = { OL_NAMES, AL_NAMES, OL_SUBJECTS, AL_SUBJECTS, SCHOLARSHIP_NAMES, SCHOLARSHIP_SUBJECTS, EXAM_SUBJECTS };
+    res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' });
+    return res.end(`window.NERVAEDU_SUBJECTS = ${JSON.stringify(catalog)};`);
+  }
+  const publicFiles = new Map([
+    ['/', ['index.html', 'text/html; charset=utf-8']],
+    ['/index.html', ['index.html', 'text/html; charset=utf-8']],
+    ['/assets/nervaedu-app.js', ['assets/nervaedu-app.js', 'text/javascript; charset=utf-8']],
+    ['/assets/nervaedu.css', ['assets/nervaedu.css', 'text/css; charset=utf-8']],
+  ]);
+  const entry = publicFiles.get(decoded);
+  if (!entry || !['GET', 'HEAD'].includes(req.method)) return json(res, 404, { error: 'File not found.' });
+  const target = path.resolve(PUBLIC_DIR, entry[0]);
+  let publicRootStat, targetStat;
+  try { publicRootStat = fs.lstatSync(PUBLIC_DIR); targetStat = fs.lstatSync(target); } catch { return json(res, 404, { error: 'File not found.' }); }
+  if (!publicRootStat.isDirectory() || publicRootStat.isSymbolicLink() || !target.startsWith(PUBLIC_DIR + path.sep) || !targetStat.isFile() || targetStat.isSymbolicLink()) return json(res, 404, { error: 'File not found.' });
+  const headers = { 'content-type': entry[1], 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' };
+  res.writeHead(200, headers);
+  if (req.method === 'HEAD') return res.end();
+  return fs.createReadStream(target).pipe(res);
 }
 const server = http.createServer(async (req, res) => {
   try {
+    if (isPrivateHttpPath(req.url)) return json(res, 404, { error: 'Not found.' });
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     if (url.pathname.startsWith('/api/')) await api(req, res, url); else staticFile(req, res, url.pathname);
   } catch (err) { if (!res.headersSent) json(res, err.status || 400, { error: err.status ? err.message : 'Something went wrong. Check your details and try again.' }); else res.destroy(); }

@@ -5,7 +5,6 @@
   "description": "A small, local-first learning space for students and teachers.",
   "scripts": {
     "start": "node server.js"
-    "start": "start"
   },
   "dependencies": {
     "firebase-admin": "^14.5.0"

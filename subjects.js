@@ -41,4 +41,3 @@ const OL_SUBJECTS = OL_NAMES.map(name => `O/L — ${name}`);
 const AL_SUBJECTS = AL_NAMES.map(name => `A/L — ${name}`);
 const EXAM_SUBJECTS = [...OL_SUBJECTS, ...AL_SUBJECTS, ...SCHOLARSHIP_SUBJECTS];
 if (typeof module !== 'undefined' && module.exports) module.exports = { OL_NAMES, AL_NAMES, OL_SUBJECTS, AL_SUBJECTS, SCHOLARSHIP_NAMES, SCHOLARSHIP_SUBJECTS, EXAM_SUBJECTS };
-if (typeof window !== 'undefined') window.NERVAEDU_SUBJECTS = { OL_NAMES, AL_NAMES, OL_SUBJECTS, AL_SUBJECTS, SCHOLARSHIP_NAMES, SCHOLARSHIP_SUBJECTS, EXAM_SUBJECTS };

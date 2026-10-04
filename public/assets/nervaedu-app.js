@@ -295,7 +295,7 @@ function bindPageActions() {
       if (published) await renderPage('resources');
     }
   };
-  $('[data-request-video], [data-request-pack]').forEach(button => button.onclick = async () => {
+  $$('[data-request-video], [data-request-pack]').forEach(button => button.onclick = async () => {
     button.disabled = true; const whatsappTab = window.open('about:blank', '_blank'); if (whatsappTab) whatsappTab.opener = null;
     try {
       const body = button.hasAttribute('data-request-video') ? { scope: 'video', resourceId: button.dataset.requestVideo } : { scope: 'pack', teacherId: button.dataset.teacher, subject: button.dataset.subject };
