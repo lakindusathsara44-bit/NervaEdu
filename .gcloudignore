@@ -1,0 +1,9 @@
+.git
+.gitignore
+.gcloudignore
+.env*
+!.env.example
+data/
+node_modules/
+.npm-cache/
+.test-run/

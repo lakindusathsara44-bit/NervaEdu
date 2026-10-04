@@ -1,0 +1,16 @@
+{
+  "name": "nervaedu-school-lms",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A small, local-first learning space for students and teachers.",
+  "scripts": {
+    "start": "node server.js"
+    "start": "start"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.5.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
