@@ -82,6 +82,16 @@ function recordLoginFailure(req) {
   else { item.count += 1; if (item.count >= 8) item.blockedUntil = now + 5 * 60 * 1000; }
 }
 function clearLoginFailures(req) { authFailures.delete(authFailureKey(req)); }
+function checkRegisterRateLimit(req) {
+  const now = Date.now(), key = 'register:' + authFailureKey(req), item = authFailures.get(key);
+  if (item && item.blockedUntil > now) throw fail(429, 'Too many registration attempts. Please wait a few minutes and try again.');
+  if (item && now - item.firstAt > 30 * 60 * 1000) authFailures.delete(key);
+}
+function recordRegisterAttempt(req) {
+  const now = Date.now(), key = 'register:' + authFailureKey(req), item = authFailures.get(key);
+  if (!item || now - item.firstAt > 30 * 60 * 1000) authFailures.set(key, { firstAt: now, count: 1, blockedUntil: 0 });
+  else { item.count += 1; if (item.count >= 5) item.blockedUntil = now + 15 * 60 * 1000; }
+}
 const mimeExt = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov', 'application/pdf': '.pdf' };
 const json = (res, status, payload) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(payload)); };
 const fail = (status, message) => Object.assign(new Error(message), { status });
@@ -257,6 +267,8 @@ function validPrice(value) {
 async function api(req, res, url) {
   const method = req.method, p = url.pathname;
   if (method === 'POST' && p === '/api/register') {
+    checkRegisterRateLimit(req);
+    recordRegisterAttempt(req);
     const body = await readBody(req, MAX_FORM); let fields, files;
     if ((req.headers['content-type'] || '').includes('multipart/form-data')) ({ fields, files } = multipart(body, req.headers['content-type']));
     else { fields = JSON.parse(body.toString('utf8')); files = []; }
@@ -304,6 +316,7 @@ async function api(req, res, url) {
   if (method === 'POST' && p === '/api/logout') {
     clearSession(res); return json(res, 200, { ok: true });
   }
+  if (method === 'GET' && p === '/api/health') return json(res, 200, { ok: true, database: persistence.enabled() ? 'firestore' : 'local' });
   if (method === 'GET' && p === '/api/me') { const u = sessionUser(req); return json(res, 200, { user: u ? publicUser(u) : null }); }
   if (method === 'GET' && p === '/api/teachers') {
     const subject = clean(url.searchParams.get('subject'), 100);
