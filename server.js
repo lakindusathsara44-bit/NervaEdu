@@ -125,6 +125,8 @@ function isPrivateHttpPath(rawUrl) {
 const isVerifiedTeacher = user => user?.role === 'teacher' && user.verificationStatus !== 'pending' && user.verificationStatus !== 'rejected';
 const publicUser = (u) => ({ id: u.id, role: u.role, name: u.name, age: u.role === 'student' ? u.age : undefined, school: u.role === 'student' ? u.school : undefined, subjects: u.subjects, qualification: u.qualification, otherQualification: u.otherQualification, thumbnail: u.thumbnail, isVerified: u.role === 'teacher' ? isVerifiedTeacher(u) : undefined, verificationStatus: u.role === 'teacher' ? (u.verificationStatus || 'verified') : undefined });
 const privateUser = (u) => ({ ...publicUser(u), phone: u.phone, address: u.address, whatsapp: u.whatsapp });
+function studentSelectedTeacherId(studentId, subject) { return db.choices[studentId]?.[subject] || null; }
+function studentCanSeeTeacherContent(studentId, resource) { return studentSelectedTeacherId(studentId, resource.subject) === resource.teacherId; }
 function activeSubscription(teacher) {
   const plan = teacher?.subscription;
   return plan?.status === 'active' && Date.parse(plan.expiresAt) > Date.now() ? plan : null;
@@ -300,7 +302,7 @@ async function api(req, res, url) {
     db.users.push({ ...user, salt, passwordHash });
     await save();
     issueSession(res, user.id);
-    return json(res, 201, { user: publicUser(user) });
+    return json(res, 201, { user: privateUser(user) });
   }
   if (method === 'POST' && p === '/api/login') {
     checkLoginRateLimit(req);
@@ -311,13 +313,13 @@ async function api(req, res, url) {
     if (!user || !crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'))) { recordLoginFailure(req); throw fail(401, 'Phone number or password is incorrect.'); }
     clearLoginFailures(req);
     issueSession(res, user.id);
-    return json(res, 200, { user: publicUser(user) });
+    return json(res, 200, { user: privateUser(user) });
   }
   if (method === 'POST' && p === '/api/logout') {
     clearSession(res); return json(res, 200, { ok: true });
   }
   if (method === 'GET' && p === '/api/health') return json(res, 200, { ok: true, database: persistence.enabled() ? 'firestore' : 'local' });
-  if (method === 'GET' && p === '/api/me') { const u = sessionUser(req); return json(res, 200, { user: u ? publicUser(u) : null }); }
+  if (method === 'GET' && p === '/api/me') { const u = sessionUser(req); return json(res, 200, { user: u ? privateUser(u) : null }); }
   if (method === 'GET' && p === '/api/teachers') {
     const subject = clean(url.searchParams.get('subject'), 100);
     const teachers = db.users.filter(u => isVerifiedTeacher(u) && (!subject || subjectsFor(u).includes(subject))).map(publicUser);
@@ -371,7 +373,7 @@ async function api(req, res, url) {
   }
   if (p === '/api/admin/teachers' && method === 'GET') {
     if (me.role !== 'admin') throw fail(403, 'Only the NervaEdu account manager can verify teachers.');
-    const teachers = db.users.filter(user => user.role === 'teacher').map(user => ({ ...publicUser(user), verificationStatus: user.verificationStatus || 'verified', plan: teacherPlanInfo(user), createdAt: user.createdAt || null }));
+    const teachers = db.users.filter(user => user.role === 'teacher').map(user => ({ ...publicUser(user), phone: user.phone, whatsapp: user.whatsapp, verificationStatus: user.verificationStatus || 'verified', plan: teacherPlanInfo(user), createdAt: user.createdAt || null }));
     return json(res, 200, { teachers });
   }
   const verifyMatch = /^\/api\/admin\/teachers\/([^/]+)\/verification$/.exec(p);
@@ -547,12 +549,12 @@ async function api(req, res, url) {
   }
   if (method === 'GET' && p === '/api/resources') {
     const subject = clean(url.searchParams.get('subject'), 100);
-    const resources = db.resources.filter(r => (!subject || r.subject === subject) && (me.role === 'teacher' ? r.teacherId === me.id : true)).map(resource => {
+    const resources = db.resources.filter(r => (!subject || r.subject === subject) && (me.role === 'teacher' ? r.teacherId === me.id : me.role === 'student' ? studentCanSeeTeacherContent(me.id, r) : true)).map(resource => {
       if (me.role !== 'student' || resource.type !== 'video') return resource;
       const accessStatus = videoAccessStatus(me.id, resource);
       return { ...resource, accessStatus, ...(!videoIsUnlocked(me.id, resource) ? { url: null, imageKitFileId: undefined, imageKitFilePath: undefined } : {}) };
     });
-    const videoPacks = db.videoPacks.filter(pack => me.role === 'teacher' ? pack.teacherId === me.id : true);
+    const videoPacks = db.videoPacks.filter(pack => me.role === 'teacher' ? pack.teacherId === me.id : me.role === 'student' ? studentSelectedTeacherId(me.id, pack.subject) === pack.teacherId : true);
     const accessRequests = me.role === 'student' ? db.accessRequests.filter(item => item.studentId === me.id) : [];
     return json(res, 200, { resources, videoPacks, accessRequests });
   }
@@ -567,7 +569,7 @@ async function api(req, res, url) {
   }
   if (method === 'GET' && p === '/api/quizzes') {
     const subject = clean(url.searchParams.get('subject'), 100);
-    const quizzes = db.quizzes.filter(q => !subject || q.subject === subject).map(q => ({ ...q, questions: q.questions.map(({ answer, ...item }) => item) }));
+    const quizzes = db.quizzes.filter(q => (!subject || q.subject === subject) && (me.role === 'teacher' ? q.teacherId === me.id : me.role === 'student' ? studentSelectedTeacherId(me.id, q.subject) === q.teacherId : true)).map(q => ({ ...q, questions: q.questions.map(({ answer, ...item }) => item) }));
     return json(res, 200, { quizzes });
   }
   const submit = /^\/api\/quizzes\/([^/]+)\/submit$/.exec(p);
