@@ -45,8 +45,43 @@ function save() {
   });
   return writeQueue;
 }
-const sessions = new Map();
 const videoReservations = new Map();
+const authFailures = new Map();
+const SESSION_SECRET = process.env.NERVAEDU_SESSION_SECRET || process.env.NERVAEDU_ADMIN_PASSWORD || 'change-this-session-secret-in-production';
+const SESSION_TTL = 7 * 24 * 60 * 60;
+function sessionCookieValue(userId) {
+  const exp = Math.floor(Date.now() / 1000) + SESSION_TTL;
+  const payload = `${userId}.${exp}`;
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+function verifySessionToken(token) {
+  const match = /^([0-9a-f-]{36})\.(\d+)\.([A-Za-z0-9_-]+)$/.exec(String(token || ''));
+  if (!match || Number(match[2]) < Math.floor(Date.now() / 1000)) return null;
+  const payload = `${match[1]}.${match[2]}`;
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  if (match[3].length !== expected.length || !crypto.timingSafeEqual(Buffer.from(match[3]), Buffer.from(expected))) return null;
+  return match[1];
+}
+function issueSession(res, userId) {
+  const token = sessionCookieValue(userId);
+  res.setHeader('set-cookie', `il_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL}${SECURE_COOKIE}`);
+}
+function clearSession(res) {
+  res.setHeader('set-cookie', `il_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${SECURE_COOKIE}`);
+}
+function authFailureKey(req) { return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim(); }
+function checkLoginRateLimit(req) {
+  const now = Date.now(), key = authFailureKey(req), item = authFailures.get(key);
+  if (item && item.blockedUntil > now) throw fail(429, 'Too many sign-in attempts. Please wait a few minutes and try again.');
+  if (item && now - item.firstAt > 10 * 60 * 1000) authFailures.delete(key);
+}
+function recordLoginFailure(req) {
+  const now = Date.now(), key = authFailureKey(req), item = authFailures.get(key);
+  if (!item || now - item.firstAt > 10 * 60 * 1000) authFailures.set(key, { firstAt: now, count: 1, blockedUntil: 0 });
+  else { item.count += 1; if (item.count >= 8) item.blockedUntil = now + 5 * 60 * 1000; }
+}
+function clearLoginFailures(req) { authFailures.delete(authFailureKey(req)); }
 const mimeExt = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'video/mp4': '.mp4', 'video/webm': '.webm', 'video/quicktime': '.mov', 'application/pdf': '.pdf' };
 const json = (res, status, payload) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(payload)); };
 const fail = (status, message) => Object.assign(new Error(message), { status });
@@ -78,7 +113,8 @@ function isPrivateHttpPath(rawUrl) {
   });
 }
 const isVerifiedTeacher = user => user?.role === 'teacher' && user.verificationStatus !== 'pending' && user.verificationStatus !== 'rejected';
-const publicUser = (u) => ({ id: u.id, role: u.role, name: u.name, age: u.age, phone: u.phone, address: u.address, school: u.school, subjects: u.subjects, whatsapp: u.whatsapp, qualification: u.qualification, otherQualification: u.otherQualification, thumbnail: u.thumbnail, isVerified: u.role === 'teacher' ? isVerifiedTeacher(u) : undefined, verificationStatus: u.role === 'teacher' ? (u.verificationStatus || 'verified') : undefined });
+const publicUser = (u) => ({ id: u.id, role: u.role, name: u.name, age: u.role === 'student' ? u.age : undefined, school: u.role === 'student' ? u.school : undefined, subjects: u.subjects, qualification: u.qualification, otherQualification: u.otherQualification, thumbnail: u.thumbnail, isVerified: u.role === 'teacher' ? isVerifiedTeacher(u) : undefined, verificationStatus: u.role === 'teacher' ? (u.verificationStatus || 'verified') : undefined });
+const privateUser = (u) => ({ ...publicUser(u), phone: u.phone, address: u.address, whatsapp: u.whatsapp });
 function activeSubscription(teacher) {
   const plan = teacher?.subscription;
   return plan?.status === 'active' && Date.parse(plan.expiresAt) > Date.now() ? plan : null;
@@ -144,7 +180,7 @@ function multipart(buffer, contentType) {
 }
 function sessionUser(req) {
   const token = /(?:^|;\s*)il_session=([^;]+)/.exec(req.headers.cookie || '')?.[1];
-  const id = token && sessions.get(token);
+  const id = verifySessionToken(token);
   return id && db.users.find(u => u.id === id);
 }
 async function storeFile(file, allowed, max) {
@@ -251,23 +287,22 @@ async function api(req, res, url) {
     const passwordHash = crypto.scryptSync(password, salt, 64).toString('hex');
     db.users.push({ ...user, salt, passwordHash });
     await save();
-    const token = crypto.randomBytes(32).toString('hex'); sessions.set(token, user.id);
-    res.setHeader('set-cookie', `il_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${SECURE_COOKIE}`);
+    issueSession(res, user.id);
     return json(res, 201, { user: publicUser(user) });
   }
   if (method === 'POST' && p === '/api/login') {
+    checkLoginRateLimit(req);
     const { phone, password } = JSON.parse((await readBody(req, MAX_FORM)).toString('utf8'));
     if (!validPhone(phone)) throw fail(401, 'Phone number or password is incorrect.');
     const user = db.users.find(u => phoneKey(u.phone) === phoneKey(phone));
     const candidate = user && crypto.scryptSync(String(password || ''), user.salt, 64).toString('hex');
-    if (!user || !crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'))) throw fail(401, 'Phone number or password is incorrect.');
-    const token = crypto.randomBytes(32).toString('hex'); sessions.set(token, user.id);
-    res.setHeader('set-cookie', `il_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${SECURE_COOKIE}`);
+    if (!user || !crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'))) { recordLoginFailure(req); throw fail(401, 'Phone number or password is incorrect.'); }
+    clearLoginFailures(req);
+    issueSession(res, user.id);
     return json(res, 200, { user: publicUser(user) });
   }
   if (method === 'POST' && p === '/api/logout') {
-    const token = /(?:^|;\s*)il_session=([^;]+)/.exec(req.headers.cookie || '')?.[1]; if (token) sessions.delete(token);
-    res.setHeader('set-cookie', `il_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${SECURE_COOKIE}`); return json(res, 200, { ok: true });
+    clearSession(res); return json(res, 200, { ok: true });
   }
   if (method === 'GET' && p === '/api/me') { const u = sessionUser(req); return json(res, 200, { user: u ? publicUser(u) : null }); }
   if (method === 'GET' && p === '/api/teachers') {
@@ -597,6 +632,10 @@ function staticFile(req, res, pathname) {
   return fs.createReadStream(target).pipe(res);
 }
 const server = http.createServer(async (req, res) => {
+  res.setHeader('x-content-type-options', 'nosniff');
+  res.setHeader('x-frame-options', 'DENY');
+  res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
+  res.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=()');
   try {
     if (isPrivateHttpPath(req.url)) return json(res, 404, { error: 'Not found.' });
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
